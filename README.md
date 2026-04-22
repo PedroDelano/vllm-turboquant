@@ -218,9 +218,87 @@ Caveats — read before running at 122B scale:
   will fit. Either free space first or target a larger filesystem by
   overriding `HF_CACHE`.
 - **CPU calibration is slow at 122B scale.** Budget many hours for
-  128 prompts × 2048 tokens on a 122B MoE on CPU. A future patch to add
-  `--device-map auto` (accelerate-based CPU/GPU offload) would cut this
-  significantly; not wired up yet.
+  128 prompts × 2048 tokens on a 122B MoE on CPU. For 1xH100 + CPU
+  offload via accelerate, pass `DEVICE_MAP=auto MAX_MEMORY_PER_GPU=70GiB
+  MAX_MEMORY_CPU=1500GiB` to the script (see next section).
+
+##### Picking calibration prompts that match your workload
+
+The JSON that `generate_turboquant_metadata.py` writes is a per-layer,
+per-KV-head list of "outlier" channel indices — the top-K channels with
+the highest activation energy (sum-of-squares) across the calibration
+set. TurboQuant keeps those channels at high precision and quantizes the
+rest. The ranking is only as good as the activations that go into it:
+channels that never fire during calibration get ranked as unimportant
+and will be quantized aggressively at serve time, even if they
+dominate a different workload.
+
+In practice this means generic text (e.g. WikiText) is a poor calibration
+set for a model that will serve **tool calling**. Tool-call KV is
+dominated by:
+
+- chat-template boundary tokens (`<|im_start|>`, `<|im_end|>`, role
+  strings, Qwen3.5's `<think>` blocks) — these fire on every turn;
+- long structured system prompts with function schemas (nested JSON);
+- JSON punctuation in tool arguments (`{`, `}`, `[`, `]`, `"`, `:`) and
+  `<tool_call>` / `<functioncall>` markers;
+- `tool` / `FUNCTION RESPONSE` turns that carry API payloads.
+
+Calibrating on raw text misses all of these channel patterns.
+
+`scripts/build_toolcalling_prompts.py` produces a calibration-ready
+JSONL from `glaiveai/glaive-function-calling-v2` (Apache-2.0, ungated,
+113K examples). For each record it parses the multi-turn chat, maps
+glaive's `USER` / `ASSISTANT` / `FUNCTION RESPONSE` markers to roles
+(`user` / `assistant` / `tool`), and re-renders through the target
+model's chat template so the calibration sees the exact token layout
+production inference will produce. Output is one
+`{"text": "<rendered prompt>"}` object per line.
+
+`benchmarks/generate_turboquant_metadata.py` accepts `.jsonl` prompt
+files natively — no format flag needed. `.txt` is unchanged:
+one-prompt-per-line.
+
+Typical flow on 1xH100 (tool calling on Qwen3.5-122B-A10B):
+
+```bash
+# 1. Build tool-calling prompts through Qwen3.5's chat template.
+#    Tokenizer from any Qwen3.5 family member works — they share a template.
+SNAPSHOT=/workspace/hf-cache/models--Qwen--Qwen3.5-0.8B/snapshots/<sha>
+/root/vllm-venv-calib/bin/python scripts/build_toolcalling_prompts.py \
+  --tokenizer "$SNAPSHOT" \
+  --output calibration/prompts/toolcalling_qwen3_5.jsonl \
+  --num-prompts 128 --max-tokens 512
+
+# 2. Calibrate 122B on 1xH100 + CPU offload against the tool-calling set.
+#    --device-map auto skips the .to() path and dispatches via accelerate;
+#    max-memory keeps ~70 GiB on GPU and offloads the rest.
+MODEL=Qwen/Qwen3.5-122B-A10B \
+DEVICE_MAP=auto MAX_MEMORY_PER_GPU=70GiB MAX_MEMORY_CPU=1500GiB \
+BATCH_SIZE=1 MAX_SEQ_LEN=512 MAX_PROMPTS=128 \
+PROMPTS_FILE=calibration/prompts/toolcalling_qwen3_5.jsonl \
+OUTPUT_JSON=calibration/Qwen_Qwen3.5-122B-A10B_turboquant35_toolcalling.json \
+  scripts/calibrate_qwen3_5.sh
+```
+
+Sanity-check the resulting JSON before serving with it:
+
+```bash
+python3 -c "
+import json
+m = json.load(open('calibration/Qwen_Qwen3.5-122B-A10B_turboquant35_toolcalling.json'))
+print('layers:', len(m['layers']))
+print('observed_tokens:', m['calibration']['num_observed_tokens'])
+print('num_prompts:', m['calibration']['num_prompts'])
+"
+```
+
+`observed_tokens` is the single best quality signal. The stub
+`tests/prompts/example.txt` produces ~150 observed tokens across 8
+short prompts — that is a plumbing test, not a calibration. 128
+chat-rendered prompts × 512 tokens yields tens of thousands of
+observed tokens, enough to stabilize the per-head channel ranking
+for a 48-layer / 2-KV-head / 256-head-size model.
 
 ## Getting Started
 

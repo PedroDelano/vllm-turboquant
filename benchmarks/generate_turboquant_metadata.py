@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 from pathlib import Path
 
 import regex as re
@@ -38,6 +39,34 @@ PROJECTION_PATTERN = re.compile(
 
 
 def _load_prompts(path: str) -> list[str]:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".jsonl":
+        prompts: list[str] = []
+        with open(path, encoding="utf-8") as f:
+            for lineno, raw in enumerate(f, start=1):
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise ValueError(
+                        f"Invalid JSONL at {path}:{lineno}: {e}"
+                    ) from e
+                if not isinstance(obj, dict):
+                    raise ValueError(
+                        f"JSONL prompts must be objects (at {path}:{lineno})."
+                    )
+                text = obj.get("text")
+                if not isinstance(text, str) or not text.strip():
+                    raise ValueError(
+                        f"JSONL prompts require a non-empty 'text' field "
+                        f"(at {path}:{lineno})."
+                    )
+                prompts.append(text)
+        if not prompts:
+            raise ValueError("The calibration JSONL prompt file is empty.")
+        return prompts
     with open(path, encoding="utf-8") as f:
         prompts = [line.strip() for line in f if line.strip()]
     if not prompts:
