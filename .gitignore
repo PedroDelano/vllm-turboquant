@@ -15,8 +15,10 @@ vllm/third_party/flashmla/flash_mla_interface.py
 # triton jit
 .triton
 
-# TurboQuant per-user calibration outputs
-/calibration/
+# TurboQuant per-user calibration outputs — ignore by default, explicitly
+# whitelist validated metadata artifacts we want to carry in-tree.
+/calibration/*
+!/calibration/Qwen_Qwen3.5-122B-A10B_turboquant35_toolcalling.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
