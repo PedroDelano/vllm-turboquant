@@ -1,4 +1,44 @@
 <!-- markdownlint-disable MD001 MD041 -->
+
+# vllm-turboquant — Qwen3.5-122B-A10B NVFP4 with TurboQuant KV cache on 1xH100
+
+This fork's headline result: serve `RedHatAI/Qwen3.5-122B-A10B-NVFP4`
+with `turboquant35` mixed-precision KV cache and a workload-matched
+tool-calling calibration on a single NVIDIA H100 (SM90). Metadata was
+generated from the unquantized bf16 base via the two-venv
+calibration flow and is checked in at
+[`calibration/Qwen_Qwen3.5-122B-A10B_turboquant35_toolcalling.json`](calibration/Qwen_Qwen3.5-122B-A10B_turboquant35_toolcalling.json)
+(54,100 observed tokens from 128 glaive-derived chat-templated
+prompts). One-shot serve command:
+
+```bash
+SNAP=/workspace/hf-cache/models--RedHatAI--Qwen3.5-122B-A10B-NVFP4/snapshots/49d19c108259a21450c40b8af38828b0a97390d8
+META=/workspace/vllm-turboquant/calibration/Qwen_Qwen3.5-122B-A10B_turboquant35_toolcalling.json
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH="$CUDA_HOME/bin:/root/vllm-venv/bin:$PATH"
+export TORCH_CUDA_ARCH_LIST="9.0"
+CUDA_VISIBLE_DEVICES=0 /root/vllm-venv/bin/vllm serve "$SNAP" \
+  --tensor-parallel-size 1 \
+  --attention-backend TRITON_ATTN \
+  --kv-cache-dtype turboquant35 \
+  --enable-turboquant \
+  --turboquant-metadata-path "$META" \
+  --max-model-len 2048 --max-num-seqs 4 \
+  --gpu-memory-utilization 0.95 \
+  --dtype bfloat16 --language-model-only \
+  --port 8000
+```
+
+Observed on the reference box (RunPod
+`pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04` image):
+~112 s engine init, ~5 s first `/v1/completions` round-trip once
+`ninja`'s flashinfer cache is warm, ~30 tok/s steady-state decode.
+Full procedure (venv bootstrap, calibration, serve, and gotchas)
+is in
+[**`docs/features/quantization/turboquant_qwen3_5.md`**](docs/features/quantization/turboquant_qwen3_5.md).
+
+---
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
