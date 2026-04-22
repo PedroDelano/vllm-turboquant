@@ -72,6 +72,7 @@ Start here for the fork-specific docs:
 
 - [Quantized KV Cache docs](docs/features/quantization/quantized_kvcache.md)
 - [TurboQuant on RTX A6000 and CUDA 12.8](docs/features/quantization/turboquant_a6000.md)
+- [TurboQuant on Qwen3.5 (H100, two-venv calibration + NVFP4 serve)](docs/features/quantization/turboquant_qwen3_5.md)
 - [TurboQuant comparison benchmark](benchmarks/run_turboquant_gb10_compare.sh)
 
 ### Running on H100 (RunPod)
@@ -141,6 +142,10 @@ curl -s http://localhost:8000/v1/completions \
 ```
 
 #### Calibrating TurboQuant for Qwen3.5 (two-venv path)
+
+Full procedure with rationale, observed timings, and gotchas:
+**[docs/features/quantization/turboquant_qwen3_5.md](docs/features/quantization/turboquant_qwen3_5.md)**.
+The summary below is enough to get started.
 
 Qwen3.5 checkpoints declare `model_type="qwen3_5_moe"` (or similar), which
 `transformers < 5` cannot parse via `AutoConfig`. vLLM's own loader handles
