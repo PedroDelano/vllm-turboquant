@@ -76,6 +76,12 @@ Start here for the fork-specific docs:
 
 ### Running on H100 (RunPod)
 
+Tested on the `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04`
+image — the `-devel` variant ships `nvcc` at `/usr/local/cuda-12.8/bin/nvcc`
+and system `gcc`/`g++`, which the Qwen3.5 serve path requires for its
+first-request JIT build (see the calibration prerequisites below).
+Host `python3.11` is ignored in favor of a uv-managed 3.12 venv.
+
 Experimental SM90 support is gated in
 `vllm/v1/attention/ops/turboquant_kv_cache.py` (the `(9, 0)` entry in
 `TURBOQUANT_SUPPORTED_CUDA_CAPABILITIES`). The TurboQuant Triton kernels
@@ -133,6 +139,88 @@ curl -s http://localhost:8000/v1/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"'"$MODEL"'","prompt":"vLLM is","max_tokens":32,"temperature":0}'
 ```
+
+#### Calibrating TurboQuant for Qwen3.5 (two-venv path)
+
+Qwen3.5 checkpoints declare `model_type="qwen3_5_moe"` (or similar), which
+`transformers < 5` cannot parse via `AutoConfig`. vLLM's own loader handles
+serving, but `benchmarks/generate_turboquant_metadata.py` goes through HF
+`AutoModel.from_pretrained` and fails before any forward pass — see the
+notes in `CLAUDE.md`.
+
+This fork pins `transformers >=4.56,<5` because upgrading in-place breaks
+vLLM. The workaround is a *second* venv used only for calibration, pinned
+at `transformers>=5`. The emitted metadata JSON is just per-layer channel
+indices — it's portable and loads cleanly into vLLM running against
+`transformers<5`.
+
+The `scripts/calibrate_qwen3_5.sh` helper orchestrates the procedure.
+Start with the smallest Qwen3.5 checkpoint as a feasibility check — if
+the pipeline produces a valid JSON on a 0.8B model and that JSON serves
+correctly, scaling up to 2B and then 122B is just a matter of memory:
+
+```bash
+# Smallest Qwen3.5 checkpoint, ~1.8 GB bf16, fits easily on one H100.
+# Calibration takes a few minutes. Writes to calibration/Qwen_Qwen3.5-0.8B_turboquant35.json
+MODEL=Qwen/Qwen3.5-0.8B RECIPE=turboquant35 \
+  scripts/calibrate_qwen3_5.sh
+
+# Serve from the main venv (transformers<5) against the calibrated JSON.
+# Qwen3.5 serve path JIT-compiles flashinfer's gdn_prefill SM90 module on
+# first request, so ninja + nvcc must be on PATH for the main venv:
+VIRTUAL_ENV=/root/vllm-venv UV_LINK_MODE=copy uv pip install ninja
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH="$CUDA_HOME/bin:/root/vllm-venv/bin:$PATH"
+export TORCH_CUDA_ARCH_LIST="9.0"
+/root/vllm-venv/bin/vllm serve \
+  /workspace/hf-cache/models--Qwen--Qwen3.5-0.8B/snapshots/<sha>/ \
+  --attention-backend TRITON_ATTN \
+  --kv-cache-dtype turboquant35 \
+  --enable-turboquant \
+  --turboquant-metadata-path \
+    calibration/Qwen_Qwen3.5-0.8B_turboquant35.json \
+  --max-model-len 2048 \
+  --gpu-memory-utilization 0.5
+```
+
+The JIT build of the SM90 gdn_prefill module takes ~3 min on first startup
+and is cached in `~/.cache/flashinfer` for subsequent runs. Without ninja
+or nvcc on PATH, the server comes up healthy but 500s on the first
+`/v1/completions` request with `FileNotFoundError: 'ninja'` in the engine
+log — this is not a TurboQuant issue, it's a Qwen3.5 hybrid-attention
+requirement.
+
+Scaling up:
+
+| Model                        | bf16 size | Disk needed | Calibration hardware              | Expected runtime |
+| ---------------------------- | --------- | ----------- | --------------------------------- | ---------------- |
+| `Qwen/Qwen3.5-0.8B`          | ~1.8 GB   | ~5 GB       | `DEVICE=cuda`                     | minutes          |
+| `Qwen/Qwen3.5-2B`            | ~4 GB     | ~10 GB      | `DEVICE=cuda`                     | minutes          |
+| `Qwen/Qwen3.5-122B-A10B`     | ~244 GB   | ~260 GB     | `DEVICE=cpu` (needs ~250 GB RAM)  | many hours       |
+
+Override with env vars: `MODEL=Qwen/Qwen3.5-2B scripts/calibrate_qwen3_5.sh`,
+or `MODEL=Qwen/Qwen3.5-122B-A10B DEVICE=cpu BATCH_SIZE=1 scripts/calibrate_qwen3_5.sh`.
+
+Caveats — read before running at 122B scale:
+
+- **HF module-naming assumption.** The calibration script discovers
+  `layers.{i}.self_attn.(k_proj|v_proj)` via regex. If transformers 5.x's
+  Qwen3.5 implementation uses a fused QKV layout (as vLLM does — see
+  `Qwen3NextAttention.qkv_proj` in `vllm/model_executor/models/qwen3_next.py`),
+  the discovery step raises a clear error. Validate on 0.8B first.
+- **Serving an NVFP4 checkpoint with TurboQuant is not yet validated on
+  this fork.** The metadata produced from the bf16 base is format-portable,
+  but the combination `--kv-cache-dtype turboquant35 --enable-turboquant`
+  plus NVFP4 weights has not been exercised end-to-end here. Serving the
+  NVFP4 checkpoint *without* TurboQuant is validated — see `CLAUDE.md`.
+- **Disk.** At 122B, `/workspace` (200 GB quota) needs to be clear of
+  the NVFP4 snapshot and any other large caches before the bf16 base
+  will fit. Either free space first or target a larger filesystem by
+  overriding `HF_CACHE`.
+- **CPU calibration is slow at 122B scale.** Budget many hours for
+  128 prompts × 2048 tokens on a 122B MoE on CPU. A future patch to add
+  `--device-map auto` (accelerate-based CPU/GPU offload) would cut this
+  significantly; not wired up yet.
 
 ## Getting Started
 
