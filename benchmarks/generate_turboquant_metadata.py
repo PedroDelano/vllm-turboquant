@@ -150,7 +150,18 @@ def _load_calibration_model(
     *,
     torch_dtype: torch.dtype | str,
     trust_remote_code: bool,
+    device_map: str | dict | None = None,
+    max_memory: dict[int | str, str] | None = None,
 ):
+    loader_kwargs: dict = dict(
+        torch_dtype=torch_dtype,
+        trust_remote_code=trust_remote_code,
+        low_cpu_mem_usage=True,
+    )
+    if device_map is not None:
+        loader_kwargs["device_map"] = device_map
+    if max_memory is not None:
+        loader_kwargs["max_memory"] = max_memory
     model_loaders = [
         AutoModelForCausalLM,
         AutoModelForImageTextToText,
@@ -163,12 +174,7 @@ def _load_calibration_model(
         if loader is None:
             continue
         try:
-            return loader.from_pretrained(
-                model_name_or_path,
-                torch_dtype=torch_dtype,
-                trust_remote_code=trust_remote_code,
-                low_cpu_mem_usage=True,
-            )
+            return loader.from_pretrained(model_name_or_path, **loader_kwargs)
         except (KeyError, ValueError) as e:
             errors.append(f"{loader.__name__}: {e}")
 
@@ -324,15 +330,25 @@ def _collect_activation_channel_scores(
     dtype: str,
     device: str,
     trust_remote_code: bool,
+    device_map: str | dict | None = None,
+    max_memory: dict[int | str, str] | None = None,
 ) -> tuple[dict[tuple[int, str], torch.Tensor], int]:
-    model_device = _resolve_device(device)
     model_torch_dtype = _resolve_torch_dtype(dtype)
     model = _load_calibration_model(
         model_name_or_path,
         trust_remote_code=trust_remote_code,
         torch_dtype=model_torch_dtype,
+        device_map=device_map,
+        max_memory=max_memory,
     )
-    model.to(model_device)
+    if device_map is None:
+        model_device = _resolve_device(device)
+        model.to(model_device)
+        input_device = model_device
+    else:
+        # accelerate-dispatched model — do not .to(); place inputs where
+        # the input embeddings actually live so the first layer sees them.
+        input_device = model.get_input_embeddings().weight.device
     model.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -359,11 +375,11 @@ def _collect_activation_channel_scores(
                 truncation=True,
                 max_length=max_seq_len,
             )
-            attention_mask = encoded["attention_mask"].to(model_device)
+            attention_mask = encoded["attention_mask"].to(input_device)
             observed_tokens += int(attention_mask.sum().item())
             accumulator.set_attention_mask(attention_mask)
             model(
-                input_ids=encoded["input_ids"].to(model_device),
+                input_ids=encoded["input_ids"].to(input_device),
                 attention_mask=attention_mask,
                 use_cache=False,
             )
@@ -488,7 +504,36 @@ def main() -> None:
     parser.add_argument(
         "--device",
         default="auto",
-        help="Calibration device, for example 'auto', 'cpu', or 'cuda:0'.",
+        help="Calibration device, for example 'auto', 'cpu', or 'cuda:0'. "
+        "Ignored when --device-map is set.",
+    )
+    parser.add_argument(
+        "--device-map",
+        default=None,
+        help=(
+            "Optional accelerate-style device_map ('auto', 'balanced', etc.) "
+            "for loading models that do not fit on a single device. When set, "
+            "--device is ignored and the model is dispatched across all "
+            "visible CUDA devices and CPU/disk per --max-memory-*. Requires "
+            "the 'accelerate' package."
+        ),
+    )
+    parser.add_argument(
+        "--max-memory-per-gpu",
+        default=None,
+        help=(
+            "Per-GPU memory budget for accelerate dispatch, e.g. '70GiB'. "
+            "Applied uniformly to every visible CUDA device. Requires "
+            "--device-map."
+        ),
+    )
+    parser.add_argument(
+        "--max-memory-cpu",
+        default=None,
+        help=(
+            "CPU-side memory budget for accelerate offload, e.g. '1500GiB'. "
+            "Requires --device-map."
+        ),
     )
     args = parser.parse_args()
 
@@ -518,6 +563,23 @@ def main() -> None:
         quantization_config=quantization_config,
     )
     required_layer_indices = _resolve_layer_indices(num_hidden_layers, layer_types)
+    max_memory: dict[int | str, str] | None = None
+    if args.max_memory_per_gpu or args.max_memory_cpu:
+        if args.device_map is None:
+            raise ValueError(
+                "--max-memory-per-gpu / --max-memory-cpu require --device-map."
+            )
+        max_memory = {}
+        if args.max_memory_per_gpu:
+            n_gpus = torch.cuda.device_count()
+            if n_gpus == 0:
+                raise ValueError(
+                    "--max-memory-per-gpu requires at least one visible CUDA device."
+                )
+            for gpu_idx in range(n_gpus):
+                max_memory[gpu_idx] = args.max_memory_per_gpu
+        if args.max_memory_cpu:
+            max_memory["cpu"] = args.max_memory_cpu
     calibration_scores, num_observed_tokens = _collect_activation_channel_scores(
         model_name_or_path=calibration_model,
         prompts=prompts,
@@ -529,6 +591,8 @@ def main() -> None:
         dtype=args.dtype,
         device=args.device,
         trust_remote_code=args.trust_remote_code,
+        device_map=args.device_map,
+        max_memory=max_memory,
     )
     metadata = _build_calibrated_metadata(
         recipe=args.kv_cache_dtype,
@@ -547,7 +611,11 @@ def main() -> None:
             batch_size=args.batch_size,
             num_observed_tokens=num_observed_tokens,
             dtype=args.dtype,
-            device=str(_resolve_device(args.device)),
+            device=(
+                f"device_map={args.device_map}"
+                if args.device_map is not None
+                else str(_resolve_device(args.device))
+            ),
             prompts_sha256=prompts_sha256,
         ),
     )

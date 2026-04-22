@@ -25,6 +25,9 @@ HF_CACHE="${HF_CACHE:-/workspace/hf-cache}"
 OUTPUT_JSON="${OUTPUT_JSON:-$REPO_ROOT/calibration/${MODEL//\//_}_${RECIPE}.json}"
 PROMPTS_FILE="${PROMPTS_FILE:-$REPO_ROOT/tests/prompts/example.txt}"
 DEVICE="${DEVICE:-cuda}"
+DEVICE_MAP="${DEVICE_MAP:-}"
+MAX_MEMORY_PER_GPU="${MAX_MEMORY_PER_GPU:-}"
+MAX_MEMORY_CPU="${MAX_MEMORY_CPU:-}"
 DTYPE="${DTYPE:-bfloat16}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 MAX_SEQ_LEN="${MAX_SEQ_LEN:-2048}"
@@ -89,7 +92,22 @@ if [ -f "$SNAPSHOT/tokenizer_config.json" ] && \
     sed -i 's/"TokenizersBackend"/"Qwen2TokenizerFast"/' "$SNAPSHOT/tokenizer_config.json"
 fi
 
-echo "[4/5] Running calibration ($MODEL, recipe=$RECIPE, device=$DEVICE, dtype=$DTYPE)"
+EXTRA_ARGS=()
+if [ -n "$DEVICE_MAP" ]; then
+    EXTRA_ARGS+=(--device-map "$DEVICE_MAP")
+fi
+if [ -n "$MAX_MEMORY_PER_GPU" ]; then
+    EXTRA_ARGS+=(--max-memory-per-gpu "$MAX_MEMORY_PER_GPU")
+fi
+if [ -n "$MAX_MEMORY_CPU" ]; then
+    EXTRA_ARGS+=(--max-memory-cpu "$MAX_MEMORY_CPU")
+fi
+
+if [ -n "$DEVICE_MAP" ]; then
+    echo "[4/5] Running calibration ($MODEL, recipe=$RECIPE, device_map=$DEVICE_MAP, dtype=$DTYPE)"
+else
+    echo "[4/5] Running calibration ($MODEL, recipe=$RECIPE, device=$DEVICE, dtype=$DTYPE)"
+fi
 "$CALIB_VENV/bin/python" "$REPO_ROOT/benchmarks/generate_turboquant_metadata.py" \
     --model "$SNAPSHOT" \
     --kv-cache-dtype "$RECIPE" \
@@ -100,7 +118,8 @@ echo "[4/5] Running calibration ($MODEL, recipe=$RECIPE, device=$DEVICE, dtype=$
     --batch-size "$BATCH_SIZE" \
     --max-seq-len "$MAX_SEQ_LEN" \
     --max-prompts "$MAX_PROMPTS" \
-    --trust-remote-code
+    --trust-remote-code \
+    "${EXTRA_ARGS[@]}"
 
 echo "[5/5] Done. Metadata: $OUTPUT_JSON"
 echo
