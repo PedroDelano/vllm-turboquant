@@ -61,7 +61,7 @@ Find the full list of supported models [here](https://docs.vllm.ai/en/latest/mod
 This fork extends vLLM's experimental TurboQuant KV-cache path with a workflow
 aimed at supported CUDA workstation GPUs:
 
-- TurboQuant KV cache on `RTX A6000 / SM86` and `GB10 / SM121`
+- TurboQuant KV cache on `RTX A6000 / SM86`, `H100 / SM90` (experimental), and `GB10 / SM121`
 - `turboquant25` and `turboquant35` KV-cache recipes on the Triton attention backend
 - Per-layer TurboQuant metadata loading from `--turboquant-metadata-path` or a local model-side `turboquant_kv.json`
 - Tensor-parallel metadata slicing for replicated and partitioned KV-head layouts
@@ -73,6 +73,29 @@ Start here for the fork-specific docs:
 - [Quantized KV Cache docs](docs/features/quantization/quantized_kvcache.md)
 - [TurboQuant on RTX A6000 and CUDA 12.8](docs/features/quantization/turboquant_a6000.md)
 - [TurboQuant comparison benchmark](benchmarks/run_turboquant_gb10_compare.sh)
+
+### Running on H100 (RunPod)
+
+Experimental SM90 support is gated in
+`vllm/v1/attention/ops/turboquant_kv_cache.py` (the `(9, 0)` entry in
+`TURBOQUANT_SUPPORTED_CUDA_CAPABILITIES`). The TurboQuant Triton kernels
+contain no SM86-specific intrinsics, so the generic tuning fallback in
+`get_turboquant_kernel_meta` is used on H100. The reference decode test
+(`test_turboquant_triton_decode_matches_reference`) passes on SM90 for
+both `turboquant25` and `turboquant35`, but kernel tuning has not been
+benchmarked for H100.
+
+RunPod-specific gotcha: `/workspace` is mounted via MooseFS/FUSE, which
+can return `ESTALE` ("Stale file handle") under the high file churn of
+`uv pip install`. Create the venv on a local overlay filesystem instead:
+
+```bash
+uv venv --python 3.12 /root/vllm-venv
+VIRTUAL_ENV=/root/vllm-venv UV_LINK_MODE=copy uv pip install -e .
+```
+
+The source tree can stay on `/workspace`; only the venv needs to be on
+local disk.
 
 ## Getting Started
 

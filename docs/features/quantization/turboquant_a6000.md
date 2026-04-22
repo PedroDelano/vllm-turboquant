@@ -45,11 +45,15 @@ target model is already quantized.
 
 ```bash
 .venv/bin/python benchmarks/generate_turboquant_metadata.py \
-  --target-model /models/target \
+  --model /models/target \
   --calibration-model /models/base \
-  --recipe turboquant35 \
+  --kv-cache-dtype turboquant35 \
+  --prompts-file tests/prompts/example.txt \
   --output /models/target/turboquant_kv.json
 ```
+
+`--calibration-model` is only required when `--model` points to a quantized
+checkpoint. `--prompts-file` takes one calibration prompt per line.
 
 ## TP=4 serving profile
 

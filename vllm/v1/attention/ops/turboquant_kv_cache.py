@@ -31,9 +31,10 @@ TURBOQUANT_QJL_SEED_OFFSET = 10_000
 TURBOQUANT_QJL_SCALE = math.sqrt(math.pi / 2.0)
 TURBOQUANT_CODEBOOK_GRID_POINTS = 32768
 TURBOQUANT_CODEBOOK_EPS = 1e-6
-TURBOQUANT_SUPPORTED_CUDA_CAPABILITIES = frozenset(((8, 6), (12, 1)))
+TURBOQUANT_SUPPORTED_CUDA_CAPABILITIES = frozenset(((8, 6), (9, 0), (12, 1)))
 TURBOQUANT_PLATFORM_REQUIREMENT = (
-    "TurboQuant currently supports RTX A6000 / SM86 and GB10 / SM121 on CUDA."
+    "TurboQuant currently supports RTX A6000 / SM86, H100 / SM90 (experimental), "
+    "and GB10 / SM121 on CUDA."
 )
 
 

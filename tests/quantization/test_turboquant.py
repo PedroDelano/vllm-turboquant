@@ -951,7 +951,7 @@ def test_turboquant_validate_configuration_rejects_unsupported_cuda_device():
         use_sparse=False,
         use_mm_prefix=False,
         use_per_head_quant_scales=False,
-        device_capability=DeviceCapability(9, 0),
+        device_capability=DeviceCapability(7, 5),
         attn_type=AttentionType.DECODER,
     )
 
