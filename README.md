@@ -97,6 +97,43 @@ VIRTUAL_ENV=/root/vllm-venv UV_LINK_MODE=copy uv pip install -e .
 The source tree can stay on `/workspace`; only the venv needs to be on
 local disk.
 
+#### Serving a small model on H100
+
+With the venv built, generate per-layer TurboQuant metadata against the
+target model and start `vllm serve` with the TurboQuant flags. This
+example uses `Qwen/Qwen2.5-0.5B-Instruct` — substitute any unquantized
+model with standard `model.layers.*.self_attn.{k,v}_proj` layout:
+
+```bash
+MODEL=Qwen/Qwen2.5-0.5B-Instruct
+
+# One-time calibration — writes turboquant_kv.json
+/root/vllm-venv/bin/python benchmarks/generate_turboquant_metadata.py \
+  --model "$MODEL" \
+  --kv-cache-dtype turboquant35 \
+  --prompts-file tests/prompts/example.txt \
+  --output /root/turboquant_kv.json
+
+# Serve
+CUDA_VISIBLE_DEVICES=0 /root/vllm-venv/bin/vllm serve "$MODEL" \
+  --tensor-parallel-size 1 \
+  --attention-backend TRITON_ATTN \
+  --kv-cache-dtype turboquant35 \
+  --enable-turboquant \
+  --turboquant-metadata-path /root/turboquant_kv.json \
+  --max-model-len 1024 \
+  --gpu-memory-utilization 0.5 \
+  --port 8000
+```
+
+Smoke-test once `/health` returns 200:
+
+```bash
+curl -s http://localhost:8000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"'"$MODEL"'","prompt":"vLLM is","max_tokens":32,"temperature":0}'
+```
+
 ## Getting Started
 
 Install vLLM with `pip` or [from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source):
