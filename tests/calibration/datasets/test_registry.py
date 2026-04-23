@@ -24,4 +24,10 @@ def test_all_registered_adapters_satisfy_protocol():
 
 
 def test_registry_contains_expected_adapters():
-    assert set(ADAPTERS.keys()) == {"glaive", "xlam", "toolace", "bfcl"}
+    assert set(ADAPTERS.keys()) == {
+        "glaive",
+        "xlam",
+        "toolace",
+        "bfcl",
+        "qwen-agent",
+    }

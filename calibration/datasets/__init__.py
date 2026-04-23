@@ -10,6 +10,7 @@ from .base import Conversation, DatasetAdapter, Message
 from .bfcl import BFCLAdapter
 from .builder import BuildReport, build
 from .glaive import GlaiveAdapter
+from .qwen_agent import QwenAgentAdapter
 from .toolace import ToolACEAdapter
 from .xlam import XLAMAdapter
 
@@ -18,6 +19,7 @@ ADAPTERS: dict[str, type] = {
     XLAMAdapter.name: XLAMAdapter,
     ToolACEAdapter.name: ToolACEAdapter,
     BFCLAdapter.name: BFCLAdapter,
+    QwenAgentAdapter.name: QwenAgentAdapter,
 }
 
 __all__ = [
@@ -28,6 +30,7 @@ __all__ = [
     "DatasetAdapter",
     "GlaiveAdapter",
     "Message",
+    "QwenAgentAdapter",
     "ToolACEAdapter",
     "XLAMAdapter",
     "build",
