@@ -19,6 +19,8 @@ vllm/third_party/flashmla/flash_mla_interface.py
 # whitelist validated metadata artifacts we want to carry in-tree.
 /calibration/*
 !/calibration/Qwen_Qwen3.5-122B-A10B_turboquant35_toolcalling.json
+!/calibration/datasets/
+!/calibration/datasets/**
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
