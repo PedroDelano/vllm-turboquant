@@ -12,7 +12,9 @@ Load-bearing context for future sessions on this repo. Update as facts change.
 - **Disk quota**: ~200 GB on `/workspace` (MooseFS mount is 378 TB aggregate but user-allocated slice is limited — confirm before large downloads).
 - **Local overlay**: `/root` on overlayfs, ~56 GB free. Use this for venv and uv cache, NEVER `/workspace` (see gotchas).
 - **Python**: 3.12.13 via `uv`.
-- **Venv**: `/root/vllm-venv` (do not recreate under `/workspace/.venv`).
+- **Venvs** (two; they intentionally have different `transformers` versions — see calibration notes):
+  - `/root/vllm-venv` — the vLLM serving venv. `transformers` pinned by vLLM (4.57.x on this fork). Do not recreate under `/workspace/.venv`.
+  - `/root/vllm-venv-calib` — the calibration venv. `transformers==5.6.0`, which **does** recognize `qwen3_5_moe`. Used by `benchmarks/generate_turboquant_metadata.py` and `scripts/build_prompts.py`. Keep these separate — upgrading transformers in the serving venv breaks vLLM.
 
 ## Key files I have written/modified on this fork
 
@@ -63,12 +65,41 @@ The 2 failures are `test_turboquant_prefill_reads_quantized_cache[turboquant25/3
   sed -i 's/"TokenizersBackend"/"Qwen2TokenizerFast"/' <snapshot>/tokenizer_config.json
   ```
   This is the community-documented fix (see vLLM issues #35998, #38024, #36443).
-- **Calibration**: `AutoConfig.from_pretrained("Qwen/Qwen3.5-122B-A10B")` raises `ValueError: ... model type 'qwen3_5_moe' but Transformers does not recognize this architecture` on transformers 4.57.6. vLLM's *own* loader handles this model (`vllm/model_executor/models/qwen3_5.py` + `registry.py:510`), so `vllm serve` works — but `benchmarks/generate_turboquant_metadata.py` fails because it goes through HF `AutoModel`. **There is no TurboQuant metadata path for this family on this fork without a transformers upgrade**, which would likely break vLLM.
-- **Serving RedHatAI NVFP4 on H100 works** (validated): 72 GB weights fit on 80 GB GPU with `--gpu-memory-utilization 0.95 --max-model-len 2048 --max-num-seqs 4 --language-model-only --dtype bfloat16`. Init takes ~280 s. KV cache headroom: ~2.4 GB → 24,576 tokens. No TurboQuant (see above).
+- **Calibration on the serving venv fails** with `AutoConfig.from_pretrained("Qwen/Qwen3.5-122B-A10B")` raising `ValueError: ... model type 'qwen3_5_moe' but Transformers does not recognize this architecture` on transformers 4.57.x. **But calibration does work from `/root/vllm-venv-calib`** (transformers 5.6.0, verified loads `qwen3_5_moe` fine). The checked-in `calibration/Qwen_Qwen3.5-122B-A10B_turboquant35_toolcalling.json` metadata was produced through this calib venv. Do not upgrade transformers in the serving venv — it would break vLLM.
+- **Serving RedHatAI NVFP4 on H100 works** (validated): 72 GB weights fit on 80 GB GPU with `--gpu-memory-utilization 0.95 --max-model-len 2048 --max-num-seqs 4 --language-model-only --dtype bfloat16`. Init takes ~280 s. KV cache headroom: ~2.4 GB → 24,576 tokens. Combine with TurboQuant metadata to enable `--kv-cache-dtype turboquant35`.
+- **`MAX_NUM_SEQS=1` triggers a vLLM assertion** on this hybrid-attention/mamba model: `_update_hybrid_attention_mamba_layout` fails with `torch.Size([2, 2, 2096, 2, 256])` ambiguity because `num_blocks=2` collides with a KV dim of 2. Use `MAX_NUM_SEQS >= 2` for bench configs — otherwise the serve process crashes during KV cache init.
 
 ### What calibration actually needs
 
-`benchmarks/generate_turboquant_metadata.py` loads the calibration model via HF `AutoModel.from_pretrained(...)`. If `AutoConfig` cannot parse the config, calibration fails before any forward pass. Check `AutoConfig` support **before** downloading a large base model.
+`benchmarks/generate_turboquant_metadata.py` loads the calibration model via HF `AutoModel.from_pretrained(...)`. If `AutoConfig` cannot parse the config, calibration fails before any forward pass. **Always run calibration from `/root/vllm-venv-calib` (transformers 5.6.0), not the serving venv.** Check `AutoConfig` support before downloading a large base model.
+
+## Calibration dataset builder (`calibration/datasets/`)
+
+Adapter-based builder. One adapter class per dataset, registered in `calibration.datasets.ADAPTERS`. Entry point `scripts/build_prompts.py --dataset {glaive,xlam,toolace,bfcl,qwen-agent}` renders any dataset through the target model's chat template (with tools passed via the tokenizer's native `tools=` argument) and writes a JSONL of `{"prompt": str, "text": str}` rows — same file feeds both `generate_turboquant_metadata.py` (reads `text`) and `vllm bench serve --dataset-name custom` (reads `prompt`).
+
+Tests at `tests/calibration/datasets/` (35 fixture-driven, no live HF). Run: `/root/vllm-venv/bin/pytest tests/calibration/datasets`.
+
+`scripts/build_toolcalling_prompts.py` was removed; `scripts/build_prompts.py --dataset glaive` is a strict superset.
+
+## Calibration workflow for Qwen3.5-122B (e.g. on 4xH100)
+
+```bash
+# 1. Build prompts (use the qwen3.5-0.8B tokenizer — family shares template).
+/root/vllm-venv-calib/bin/python scripts/build_prompts.py \
+  --dataset qwen-agent \
+  --tokenizer /path/to/Qwen3.5-0.8B/snapshot \
+  --output calibration/prompts/qwen_agent_qwen3_5.jsonl \
+  --num-prompts 256 --min-tokens 128 --max-tokens 4096
+
+# 2. Calibrate (244 GB bf16 fits on 4x80 GB; CPU offload not needed).
+/root/vllm-venv-calib/bin/python benchmarks/generate_turboquant_metadata.py \
+  --model Qwen/Qwen3.5-122B-A10B \
+  --kv-cache-dtype turboquant35 \
+  --prompts-file calibration/prompts/qwen_agent_qwen3_5.jsonl \
+  --output calibration/Qwen_Qwen3.5-122B-A10B_turboquant35_qwen_agent.json
+```
+
+Workload-matching matters: glaive-calibrated metadata does NOT generalize to agent trajectories — a 2026-04-23 A/B bench on `RedHatAI/Qwen3.5-122B-A10B-NVFP4` with qwen-agent prompts and glaive-calibrated metadata showed **14× wall-time regression, TTFT from 889 ms → 22,837 ms, and only 15.6% exact-match** vs bf16 KV. If you care about agentic tool-calling at serve time, calibrate on an agent dataset like `qwen-agent`, not on glaive. Raw results live in `benchmarks/results_qwen_agent/` (untracked).
 
 ## Gotchas
 
