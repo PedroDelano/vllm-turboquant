@@ -291,14 +291,18 @@ dominated by:
 
 Calibrating on raw text misses all of these channel patterns.
 
-`scripts/build_toolcalling_prompts.py` produces a calibration-ready
+`scripts/build_prompts.py --dataset glaive` produces a calibration-ready
 JSONL from `glaiveai/glaive-function-calling-v2` (Apache-2.0, ungated,
 113K examples). For each record it parses the multi-turn chat, maps
 glaive's `USER` / `ASSISTANT` / `FUNCTION RESPONSE` markers to roles
 (`user` / `assistant` / `tool`), and re-renders through the target
 model's chat template so the calibration sees the exact token layout
 production inference will produce. Output is one
-`{"text": "<rendered prompt>"}` object per line.
+`{"prompt": "<rendered>", "text": "<rendered>"}` object per line —
+the same file doubles as a `vllm bench serve --dataset-name custom`
+dataset. Other tool-calling datasets (xlam, ToolACE, BFCL) can be
+swapped in via `--dataset {xlam,toolace,bfcl}`; see
+`calibration/datasets/` for the adapter registry.
 
 `benchmarks/generate_turboquant_metadata.py` accepts `.jsonl` prompt
 files natively — no format flag needed. `.txt` is unchanged:
@@ -310,7 +314,8 @@ Typical flow on 1xH100 (tool calling on Qwen3.5-122B-A10B):
 # 1. Build tool-calling prompts through Qwen3.5's chat template.
 #    Tokenizer from any Qwen3.5 family member works — they share a template.
 SNAPSHOT=/workspace/hf-cache/models--Qwen--Qwen3.5-0.8B/snapshots/<sha>
-/root/vllm-venv-calib/bin/python scripts/build_toolcalling_prompts.py \
+/root/vllm-venv-calib/bin/python scripts/build_prompts.py \
+  --dataset glaive \
   --tokenizer "$SNAPSHOT" \
   --output calibration/prompts/toolcalling_qwen3_5.jsonl \
   --num-prompts 128 --max-tokens 512

@@ -111,18 +111,23 @@ For a tool-calling workload the relevant activations are dominated by:
 
 Raw text calibration (WikiText etc.) misses every one.
 
-`scripts/build_toolcalling_prompts.py` streams
+`scripts/build_prompts.py --dataset glaive` streams
 `glaiveai/glaive-function-calling-v2` (Apache-2.0, ungated, 113K
 rows), parses each record's `USER` / `ASSISTANT` / `FUNCTION
 RESPONSE` markers into Qwen roles (`user` / `assistant` / `tool`),
 and renders through the target model's chat template. Output is
-JSONL — one `{"text": "<rendered>"}` per line.
-`benchmarks/generate_turboquant_metadata.py` detects `.jsonl`
-automatically:
+JSONL — one `{"prompt": "<rendered>", "text": "<rendered>"}` per
+line. `benchmarks/generate_turboquant_metadata.py` reads `text`;
+`vllm bench serve --dataset-name custom` reads `prompt`; the same
+file works for both.
+
+Other tool-calling sources (`xlam`, `toolace`, `bfcl`) are registered
+in `calibration/datasets/` — swap via `--dataset <name>`.
 
 ```bash
 SNAP_08=/workspace/hf-cache/models--Qwen--Qwen3.5-0.8B/snapshots/<sha>
-/root/vllm-venv-calib/bin/python scripts/build_toolcalling_prompts.py \
+/root/vllm-venv-calib/bin/python scripts/build_prompts.py \
+  --dataset glaive \
   --tokenizer "$SNAP_08" \
   --output calibration/prompts/toolcalling_qwen3_5.jsonl \
   --num-prompts 128 --max-tokens 512
@@ -290,8 +295,10 @@ compute envelope of one H100.
 
 - `scripts/calibrate_qwen3_5.sh` — calibration orchestration (venv +
   download + tokenizer patch + metadata generation).
-- `scripts/build_toolcalling_prompts.py` — glaive →
-  chat-templated JSONL for tool-calling calibration.
+- `scripts/build_prompts.py` + `calibration/datasets/` — adapter
+  registry + CLI that renders any of {glaive, xlam, ToolACE, BFCL}
+  into a chat-templated JSONL usable for calibration and
+  `vllm bench serve`.
 - `benchmarks/generate_turboquant_metadata.py` — the calibration
   entry-point. `--device-map` / `--max-memory-per-gpu` /
   `--max-memory-cpu` handle the 1xH100 offload case; the `.jsonl`
