@@ -275,4 +275,20 @@ class CacheConfig:
                 "turboquant_recent_ring_capacity must be >= 0; got "
                 f"{self.turboquant_recent_ring_capacity}."
             )
+        if (
+            self.turboquant_recent_ring_capacity > 0
+            and self.enable_prefix_caching
+        ):
+            raise ValueError(
+                "TurboQuant recent-token ring "
+                f"(turboquant_recent_ring_capacity={self.turboquant_recent_ring_capacity}) "
+                "is incompatible with prefix caching. Prefix-cache hits bypass "
+                "`do_kv_cache_update`, leaving the ring missing the shared-prefix "
+                "tokens that attention relies on at decode time — output "
+                "silently degenerates. Pass `--no-enable-prefix-caching` on "
+                "`vllm serve` (or set `enable_prefix_caching=False` in code) "
+                "when using the turboquant ring. See "
+                "docs/investigations/qwen3_5_turboquant_failure.md for the "
+                "evidence."
+            )
         return self
