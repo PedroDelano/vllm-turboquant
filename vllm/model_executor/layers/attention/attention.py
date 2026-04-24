@@ -319,6 +319,13 @@ class Attention(nn.Module, AttentionLayerBase):
             extra_impl_args["turboquant_metadata_path"] = (
                 None if cache_config is None else cache_config.turboquant_metadata_path
             )
+            extra_impl_args["turboquant_recent_ring_capacity"] = (
+                0
+                if cache_config is None
+                else int(
+                    getattr(cache_config, "turboquant_recent_ring_capacity", 0)
+                )
+            )
 
         impl_cls = self.attn_backend.get_impl_cls()
         self.impl = impl_cls(
@@ -657,18 +664,37 @@ def unified_kv_cache_update(
     Returns a dummy that is passed to unified_attention to signal a side effect and
     the data dependency between them to ensure torch.compile preserves ordering.
     """
-    _, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(layer_name)
+    attn_metadata, attn_layer, kv_cache, layer_slot_mapping = get_attention_context(
+        layer_name
+    )
     if layer_slot_mapping is not None:
         assert hasattr(attn_layer.impl, "do_kv_cache_update"), (
             f"{attn_layer.impl.__class__.__name__} does not support kv cache update"
         )
-        attn_layer.impl.do_kv_cache_update(
-            attn_layer,
-            key,
-            value,
-            kv_cache,
-            layer_slot_mapping,
-        )
+        # Pass attn_metadata as an optional kwarg so implementations that
+        # opt into per-sequence bookkeeping (e.g. TurboQuant recent-token
+        # ring) can observe the active batch without changing the custom op
+        # signature. Impls that don't accept the kwarg silently ignore it
+        # via the **kwargs-compatible default below.
+        try:
+            attn_layer.impl.do_kv_cache_update(
+                attn_layer,
+                key,
+                value,
+                kv_cache,
+                layer_slot_mapping,
+                attn_metadata=attn_metadata,
+            )
+        except TypeError:
+            # Back-compat for impls whose do_kv_cache_update has not been
+            # updated to accept attn_metadata.
+            attn_layer.impl.do_kv_cache_update(
+                attn_layer,
+                key,
+                value,
+                kv_cache,
+                layer_slot_mapping,
+            )
 
     return torch.empty(0, device=kv_cache.device, dtype=kv_cache.dtype)
 

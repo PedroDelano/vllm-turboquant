@@ -39,16 +39,50 @@ The `.whl` in `build/release/` is a 12 KB editable shim that points back at the 
 
 ## Known-working TurboQuant recipe on H100
 
-Validated end-to-end with `Qwen/Qwen2.5-0.5B-Instruct`, `turboquant35`, generated from `tests/prompts/example.txt`. Reference decode test passes for both recipes (`test_turboquant_triton_decode_matches_reference`). Full example flow is in the README under "Running on H100 (RunPod)".
+The **fused Triton decode kernel** (`turboquant_decode_attention_fwd`) produces
+degenerate output (newline spam, repetition loops) on prompts longer than
+~150 tokens — see `docs/investigations/qwen3_5_turboquant_failure.md` for the
+evidence. The fork ships with a **dequantize-then-attend decode path** that
+avoids the broken fused kernel. Enable it by setting
+`--turboquant-recent-ring-capacity > 0` on `vllm serve`.
 
-Serve flags that must be present together:
+Design and implementation notes:
+- `docs/superpowers/specs/2026-04-24-turboquant-dequantize-decode-design.md`
+- `docs/superpowers/plans/2026-04-24-turboquant-dequantize-decode.md`
+
+Required serve flags for coherent output:
 
 ```
 --attention-backend TRITON_ATTN
 --kv-cache-dtype turboquant{25,35}
 --enable-turboquant
 --turboquant-metadata-path /path/to/turboquant_kv.json
+--turboquant-recent-ring-capacity 1024    # recent-window bf16 ring; see notes
+--no-enable-prefix-caching                 # see below — required with the ring
 ```
+
+**`--no-enable-prefix-caching` is required** when the ring is active. With
+prefix caching ON, vLLM reuses KV for shared prompt prefixes and those tokens
+never flow through `do_kv_cache_update`, so the ring is missing the very
+tokens attention relies on — outputs degenerate.
+
+**Ring capacity tuning.** On this fork's turboquant35 (3.5-bit mixed-group
+quantization), per-vector dequant error is ~12-17% per token. That error
+accumulates in the attention sum, so beyond ~100 dequantized tokens the
+softmax becomes noise-dominated. Set `--turboquant-recent-ring-capacity`
+large enough that the ring covers the attention-heavy region of your
+expected prompts:
+
+| Context length | Recommended ring | Effective KV compression |
+|---:|---:|---:|
+| 4K              | 512             | ~88% |
+| 16K             | 1024            | ~94% |
+| 32K             | 2048            | ~94% |
+
+Above ring size ≥ ~1024 the output quality matches bf16 baseline
+(`tests/quantization/test_turboquant_dequant_decode.py` shows
+mean-unique-token-ratio 0.84 vs bf16's 0.80 on the 8 glaive-formatted
+prompts that previously collapsed to newlines).
 
 ## Tests — current state on SM90
 

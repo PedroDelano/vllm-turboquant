@@ -23,11 +23,23 @@ CUDA_VISIBLE_DEVICES=0 /root/vllm-venv/bin/vllm serve "$SNAP" \
   --kv-cache-dtype turboquant35 \
   --enable-turboquant \
   --turboquant-metadata-path "$META" \
+  --turboquant-recent-ring-capacity 1024 \
+  --no-enable-prefix-caching \
   --max-model-len 2048 --max-num-seqs 4 \
   --gpu-memory-utilization 0.95 \
   --dtype bfloat16 --language-model-only \
   --port 8000
 ```
+
+`--turboquant-recent-ring-capacity 1024` switches decode to a
+dequantize-then-attend path with a bf16 recent-token ring; the fused
+Triton decode kernel produces degenerate output on prompts > ~150 tokens
+and is bypassed when this flag is non-zero. `--no-enable-prefix-caching`
+is required alongside it — with prefix caching on, shared-prompt-prefix
+tokens bypass the ring and attention still collapses. See
+`docs/investigations/qwen3_5_turboquant_failure.md` and
+`docs/superpowers/specs/2026-04-24-turboquant-dequantize-decode-design.md`
+for background.
 
 Observed on the reference box (RunPod
 `pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04` image):
@@ -168,6 +180,8 @@ CUDA_VISIBLE_DEVICES=0 /root/vllm-venv/bin/vllm serve "$MODEL" \
   --kv-cache-dtype turboquant35 \
   --enable-turboquant \
   --turboquant-metadata-path /root/turboquant_kv.json \
+  --turboquant-recent-ring-capacity 512 \
+  --no-enable-prefix-caching \
   --max-model-len 1024 \
   --gpu-memory-utilization 0.5 \
   --port 8000
@@ -224,6 +238,8 @@ export TORCH_CUDA_ARCH_LIST="9.0"
   --enable-turboquant \
   --turboquant-metadata-path \
     calibration/Qwen_Qwen3.5-0.8B_turboquant35.json \
+  --turboquant-recent-ring-capacity 1024 \
+  --no-enable-prefix-caching \
   --max-model-len 2048 \
   --gpu-memory-utilization 0.5
 ```

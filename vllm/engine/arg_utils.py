@@ -395,6 +395,7 @@ class EngineArgs:
     kv_cache_dtype: CacheDType = CacheConfig.cache_dtype
     enable_turboquant: bool = CacheConfig.enable_turboquant
     turboquant_metadata_path: str | None = CacheConfig.turboquant_metadata_path
+    turboquant_recent_ring_capacity: int = CacheConfig.turboquant_recent_ring_capacity
     seed: int = ModelConfig.seed
     max_model_len: int = ModelConfig.max_model_len
     cudagraph_capture_sizes: list[int] | None = (
@@ -1007,6 +1008,14 @@ class EngineArgs:
             "--turboquant-metadata-path",
             **cache_kwargs["turboquant_metadata_path"],
         )
+        cache_kwargs["turboquant_recent_ring_capacity"]["help"] = (
+            "Number of most-recent tokens per sequence kept uncompressed "
+            "alongside the turboquant cache. 0 disables the ring buffer."
+        )
+        cache_group.add_argument(
+            "--turboquant-recent-ring-capacity",
+            **cache_kwargs["turboquant_recent_ring_capacity"],
+        )
         cache_group.add_argument(
             "--kv-sharing-fast-prefill", **cache_kwargs["kv_sharing_fast_prefill"]
         )
@@ -1583,6 +1592,7 @@ class EngineArgs:
             calculate_kv_scales=self.calculate_kv_scales,
             enable_turboquant=self.enable_turboquant,
             turboquant_metadata_path=self.turboquant_metadata_path,
+            turboquant_recent_ring_capacity=self.turboquant_recent_ring_capacity,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,
             mamba_ssm_cache_dtype=self.mamba_ssm_cache_dtype,

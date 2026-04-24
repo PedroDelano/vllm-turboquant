@@ -100,6 +100,12 @@ class CacheConfig:
     turboquant_metadata_path: str | None = None
     """Optional path to the TurboQuant per-layer metadata JSON artifact.
     If unset, vLLM looks for `turboquant_kv.json` under the local model path."""
+    turboquant_recent_ring_capacity: int = 64
+    """Number of most-recent tokens per sequence to keep in an uncompressed
+    bf16 ring buffer alongside the turboquant packed cache. Used at decode
+    time to override the dequantized values for positions where attention
+    mass concentrates. Set to 0 to disable the ring buffer (decode still
+    works — pure dequant path — just slightly lossier on recent tokens)."""
     mamba_page_size_padded: int | None = None
     """ Optional override for mamba page size; used by hybrid mamba/attention
     models to ensure exact alignment with attention page size."""
@@ -264,4 +270,9 @@ class CacheConfig:
         capability = current_platform.get_device_capability()
         if not supports_turboquant_cuda(capability):
             raise ValueError(get_turboquant_platform_requirement())
+        if self.turboquant_recent_ring_capacity < 0:
+            raise ValueError(
+                "turboquant_recent_ring_capacity must be >= 0; got "
+                f"{self.turboquant_recent_ring_capacity}."
+            )
         return self

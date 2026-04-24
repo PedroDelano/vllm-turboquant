@@ -48,6 +48,7 @@ from vllm.v1.attention.ops.triton_turboquant_kv_update import (
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.attention.ops.turboquant_kv_cache import (
     TurboQuantLayout,
+    dequantize_turboquant_vectors,
     get_turboquant_bits,
     get_turboquant_centroids,
     get_turboquant_group_dims,
@@ -63,6 +64,13 @@ from vllm.v1.attention.ops.turboquant_kv_cache import (
     get_turboquant_rotation,
     is_turboquant_kv_cache,
     supports_turboquant_cuda,
+)
+from vllm.v1.attention.ops.turboquant_recent_ring import (
+    RecentRing,
+    allocate_recent_ring,
+    append_recent,
+    gather_recent,
+    write_prefill_tail,
 )
 from vllm.v1.attention.ops.turboquant_metadata import (
     TurboQuantLayerMetadata,
@@ -93,6 +101,26 @@ def _get_turboquant_tp_context() -> tuple[int, int]:
         )
     except AssertionError:
         return (0, 1)
+
+
+def _gather_packed_kv_for_seq(
+    kv_cache: torch.Tensor,
+    block_table_row: torch.Tensor,
+    seq_len: int,
+) -> torch.Tensor:
+    """Return a contiguous (seq_len, num_kv_heads, packed_dim) slice.
+
+    kv_cache: (num_blocks, block_size, num_kv_heads, packed_dim) uint8
+    block_table_row: (max_blocks_per_seq,) int32
+    """
+    block_size = kv_cache.shape[1]
+    num_blocks_needed = (seq_len + block_size - 1) // block_size
+    block_ids = block_table_row[:num_blocks_needed].to(torch.int64)
+    blocks = kv_cache[block_ids]  # (num_blocks_needed, block_size, num_kv_heads, packed_dim)
+    blocks = blocks.reshape(
+        num_blocks_needed * block_size, kv_cache.shape[2], kv_cache.shape[3]
+    )
+    return blocks[:seq_len].contiguous()
 
 
 @dataclass
@@ -494,6 +522,7 @@ class TritonAttentionImpl(AttentionImpl):
         turboquant_model_name: str | None = None,
         turboquant_metadata_path: str | None = None,
         turboquant_metadata: TurboQuantMetadata | None = None,
+        turboquant_recent_ring_capacity: int = 0,
         use_alibi_sqrt: bool = False,
     ) -> None:
         self.num_heads = num_heads
@@ -568,6 +597,11 @@ class TritonAttentionImpl(AttentionImpl):
         self._turboquant_metadata = turboquant_metadata
         self._turboquant_layer_name = turboquant_layer_name
         self._turboquant_layer_metadata: TurboQuantLayerMetadata | None = None
+        # TurboQuant recent-token ring buffer. Always declared so that the
+        # attribute exists regardless of whether TurboQuant is enabled; the
+        # actual buffers are allocated lazily in _ensure_recent_ring.
+        self._recent_ring_capacity: int = 0
+        self._recent_ring: RecentRing | None = None
 
         self.sinks = sinks
         if sinks is not None:
@@ -650,6 +684,13 @@ class TritonAttentionImpl(AttentionImpl):
                 self.kv_cache_dtype,
                 scope="local",
             )
+            self._recent_ring_capacity = int(turboquant_recent_ring_capacity)
+            if self._recent_ring_capacity > 0:
+                logger.info_once(
+                    "TurboQuant recent-ring enabled: capacity=%d",
+                    self._recent_ring_capacity,
+                    scope="local",
+                )
 
     def _get_turboquant_tables(
         self,
@@ -797,6 +838,46 @@ class TritonAttentionImpl(AttentionImpl):
         )
         self._turboquant_masks[cache_key] = masks
         return masks
+
+    def _ensure_recent_ring(
+        self,
+        *,
+        device: torch.device,
+        num_seqs: int,
+    ) -> None:
+        """Lazily allocate / grow the recent-token ring buffer.
+
+        Called from the KV write path. If capacity is 0, this is a no-op.
+        Growing the ring preserves state for already-tracked sequences so
+        that ongoing decodes do not lose their recent-K/V history.
+        """
+        if self._recent_ring_capacity <= 0:
+            return
+        if (
+            self._recent_ring is not None
+            and self._recent_ring.num_seqs >= num_seqs
+        ):
+            return
+        new_ring = allocate_recent_ring(
+            num_seqs=num_seqs,
+            capacity=self._recent_ring_capacity,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_size,
+            device=device,
+        )
+        if self._recent_ring is not None:
+            # Preserve state for already-tracked sequences.
+            old = self._recent_ring
+            n = old.num_seqs
+            for attr in (
+                "keys",
+                "values",
+                "write_ptr",
+                "fill_count",
+                "total_appends",
+            ):
+                getattr(new_ring, attr)[:n].copy_(getattr(old, attr))
+        self._recent_ring = new_ring
 
     def _get_turboquant_query_group_indices(
         self,
@@ -1081,11 +1162,24 @@ class TritonAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
+        attn_metadata=None,
     ):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
             return
+        # Second line of defense: if attn_metadata wasn't threaded through
+        # (e.g. fused RoPE+KV call site), look it up on the forward context so
+        # the ring-buffer write path stays reachable for every call.
+        if attn_metadata is None and self._recent_ring_capacity > 0:
+            try:
+                from vllm.forward_context import get_forward_context
+                ctx_meta = get_forward_context().attn_metadata
+                if isinstance(ctx_meta, dict):
+                    ctx_meta = ctx_meta.get(layer.layer_name)
+                attn_metadata = ctx_meta
+            except Exception:
+                pass
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(1)
 
@@ -1124,6 +1218,45 @@ class TritonAttentionImpl(AttentionImpl):
                 mse_to_qjl_matrices=mse_to_qjl_matrices,
                 centroids=centroids,
             )
+            if self._recent_ring_capacity > 0:
+                if attn_metadata is None:
+                    logger.warning_once(
+                        "TurboQuant recent-ring capacity=%d configured but "
+                        "attn_metadata was not threaded into "
+                        "do_kv_cache_update; ring will not receive writes.",
+                        self._recent_ring_capacity,
+                        scope="local",
+                    )
+                else:
+                    self._ensure_recent_ring(
+                        device=key.device,
+                        num_seqs=attn_metadata.seq_lens.shape[0],
+                    )
+                    query_start_loc_cpu = attn_metadata.query_start_loc_cpu
+                    for seq_id in range(query_start_loc_cpu.shape[0] - 1):
+                        s = int(query_start_loc_cpu[seq_id].item())
+                        e = int(query_start_loc_cpu[seq_id + 1].item())
+                        n = e - s
+                        if n == 0:
+                            continue
+                        if (
+                            int(self._recent_ring.total_appends[seq_id].item())
+                            == 0
+                        ):
+                            write_prefill_tail(
+                                self._recent_ring,
+                                seq_id=seq_id,
+                                keys=key[s:e],
+                                values=value[s:e],
+                            )
+                        else:
+                            for i in range(n):
+                                append_recent(
+                                    self._recent_ring,
+                                    seq_id=seq_id,
+                                    key=key[s + i],
+                                    value=value[s + i],
+                                )
             return
 
         # Reshape the input keys and values and store them in the cache.
@@ -1180,7 +1313,23 @@ class TritonAttentionImpl(AttentionImpl):
             query.copy_(rotated_query)
             assert rotated_key is not None
             key.copy_(rotated_key)
-            self.do_kv_cache_update(layer, key, value, kv_cache, layer_slot_mapping)
+            # Fetch attn_metadata from the forward context so the ring-buffer
+            # write path (inside do_kv_cache_update) can use it. Without this,
+            # the fused RoPE+KV path skips ring population even when capacity
+            # is configured.
+            _attn_metadata = None
+            if self._recent_ring_capacity > 0:
+                try:
+                    from vllm.forward_context import get_forward_context
+                    _attn_metadata = get_forward_context().attn_metadata
+                    if isinstance(_attn_metadata, dict):
+                        _attn_metadata = _attn_metadata.get(layer.layer_name)
+                except Exception:
+                    _attn_metadata = None
+            self.do_kv_cache_update(
+                layer, key, value, kv_cache, layer_slot_mapping,
+                attn_metadata=_attn_metadata,
+            )
             return
 
         key_cache, value_cache = kv_cache.unbind(1)
@@ -1517,6 +1666,39 @@ class TritonAttentionImpl(AttentionImpl):
             )
             return output
 
+        # Non-cascade decode path: route through the dequantize+SDPA path
+        # when none of the feature flags the dequant path doesn't yet
+        # support are active. This matches the reference TurboQuant repo's
+        # production behaviour and avoids the fused kernel's long-prompt
+        # precision drift. See
+        # docs/superpowers/specs/2026-04-24-turboquant-dequantize-decode-design.md.
+        #
+        # Features NOT yet supported by _forward_turboquant_dequant, which
+        # force a fallback to the fused decode kernel:
+        #   - sliding window attention
+        #   - attention sinks
+        #   - logits soft-cap
+        #   - mm-prefix ranges
+        #   - non-causal (cross) attention / encoder KV lens
+        #   - query dtype mismatch vs dequant dtype (bf16)
+        use_dequant_path = (
+            self.sliding_window == (-1, -1)
+            and self.sinks is None
+            and self.logits_soft_cap == 0
+            and mm_prefix_range_tensor is None
+            and attn_metadata.causal
+            and attn_metadata.encoder_seq_lens is None
+            and query.dtype == torch.bfloat16
+        )
+        if use_dequant_path:
+            return self._forward_turboquant_dequant(
+                query=query,
+                key_cache=key_cache,
+                value_cache=value_cache,
+                output=output,
+                attn_metadata=attn_metadata,
+            )
+
         turboquant_decode_attention_fwd(
             query=query,
             key_cache=key_cache,
@@ -1556,4 +1738,109 @@ class TritonAttentionImpl(AttentionImpl):
             logits_soft_cap=self.logits_soft_cap,
             out=output,
         )
+        return output
+
+    def _forward_turboquant_dequant(
+        self,
+        *,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        output: torch.Tensor,
+        attn_metadata,
+    ) -> torch.Tensor:
+        """Decode path that dequantizes the packed cache to bf16 and runs
+        standard SDPA. Bypasses the fused turboquant decode kernel.
+
+        See docs/superpowers/specs/2026-04-24-turboquant-dequantize-decode-design.md
+        for the motivation (fused kernel accumulates precision error on long
+        prompts; dequant+SDPA matches the reference TurboQuant repo's
+        production path).
+
+        This method requires the turboquant tables and masks to be
+        initialized via _get_turboquant_tables / _ensure_turboquant_masks
+        on the query's device (same preconditions as _forward_turboquant's
+        full path).
+        """
+        import torch.nn.functional as F
+
+        assert self.turboquant_bits is not None
+        self._validate_turboquant_device(query.device)
+
+        tables = self._get_turboquant_tables(query.device)
+        rotations = tables[0]
+        qjl_matrices = tables[1]
+        centroids = tables[2]
+        key_masks, value_masks = self._ensure_turboquant_masks(query.device)
+        recent_ring: RecentRing | None = getattr(self, "_recent_ring", None)
+
+        query_start_loc_cpu = attn_metadata.query_start_loc_cpu
+        seq_lens_cpu = attn_metadata.seq_lens_cpu
+        num_seqs = seq_lens_cpu.shape[0]
+
+        for seq_id in range(num_seqs):
+            start = int(query_start_loc_cpu[seq_id].item())
+            end = int(query_start_loc_cpu[seq_id + 1].item())
+            if end == start:
+                continue
+            seq_len = int(seq_lens_cpu[seq_id].item())
+
+            block_table_row = attn_metadata.block_table[seq_id]
+
+            packed_k = _gather_packed_kv_for_seq(
+                key_cache, block_table_row, seq_len
+            )
+            packed_v = _gather_packed_kv_for_seq(
+                value_cache, block_table_row, seq_len
+            )
+
+            dequant_k = dequantize_turboquant_vectors(
+                packed_k, self.kv_cache_dtype, self.head_size,
+                rotations, qjl_matrices, centroids, key_masks,
+                torch.bfloat16,
+            )
+            dequant_v = dequantize_turboquant_vectors(
+                packed_v, self.kv_cache_dtype, self.head_size,
+                rotations, qjl_matrices, centroids, value_masks,
+                torch.bfloat16,
+            )
+
+            if recent_ring is not None:
+                recent_k, recent_v, n_recent = gather_recent(
+                    recent_ring, seq_id=seq_id
+                )
+                # Clip to avoid overrunning a sequence that's shorter than
+                # the populated ring entries (can happen after seq_id reuse
+                # across requests when the ring keeps stale state).
+                n_use = min(n_recent, dequant_k.shape[0])
+                if n_use > 0:
+                    dequant_k[-n_use:] = recent_k[-n_use:]
+                    dequant_v[-n_use:] = recent_v[-n_use:]
+
+            q_3d = query[start:end].view(
+                end - start, self.num_heads, self.head_size
+            )
+
+            # SDPA expects (batch, heads, tokens, dim).
+            kv_repeat = self.num_heads // self.num_kv_heads
+            k_rep = (
+                dequant_k.repeat_interleave(kv_repeat, dim=1)
+                if kv_repeat > 1 else dequant_k
+            )
+            v_rep = (
+                dequant_v.repeat_interleave(kv_repeat, dim=1)
+                if kv_repeat > 1 else dequant_v
+            )
+
+            q_t = q_3d.transpose(0, 1).unsqueeze(0)
+            k_t = k_rep.transpose(0, 1).unsqueeze(0)
+            v_t = v_rep.transpose(0, 1).unsqueeze(0)
+
+            out = F.scaled_dot_product_attention(
+                q_t, k_t, v_t,
+                is_causal=(end - start) > 1,
+                scale=self.scale,
+            )
+            output[start:end] = out.squeeze(0).transpose(0, 1)
+
         return output
