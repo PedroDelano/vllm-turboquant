@@ -167,7 +167,9 @@ _kill_serve
 _launch_serve "turboquant35" \
     --kv-cache-dtype turboquant35 \
     --enable-turboquant \
-    --turboquant-metadata-path "$META"
+    --turboquant-metadata-path "$META" \
+    --turboquant-recent-ring-capacity "${TURBOQUANT_RING_CAPACITY:-1024}" \
+    --no-enable-prefix-caching
 _wait_for_health
 _warmup_first_request
 _run_bench "turboquant35"
