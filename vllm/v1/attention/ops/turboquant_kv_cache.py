@@ -894,3 +894,33 @@ def dequantize_turboquant_vectors(
         group_indices=group_indices,
         kv_head_for_query_head=kv_head_for_query_head,
     )
+
+
+_compiled_dequantize_turboquant_vectors = None
+
+
+def _get_compiled_dequant():
+    """Return a cached, torch.compile'd wrapper around
+    dequantize_turboquant_vectors.
+
+    Compiled lazily so code paths that don't exercise the serving hot
+    path don't pay compile overhead. `dynamic=True` shares one compiled
+    graph across varying seq_len. `fullgraph=False` tolerates graph
+    breaks on any `.item()` or Python-control-flow points inside the
+    function. `mode="reduce-overhead"` folds launches into CUDA graphs
+    where safe.
+    """
+    global _compiled_dequantize_turboquant_vectors
+    if _compiled_dequantize_turboquant_vectors is None:
+        # NOTE: earlier experimentation showed `mode="reduce-overhead"` +
+        # `dynamic=True` hangs during long-prompt decode on this codebase
+        # (see docs/superpowers/plans/2026-04-24-turboquant-dequant-perf.md
+        # Task 7 notes). `mode="default"` avoids CUDA graph capture and
+        # fares better with our varying seq_len inputs.
+        _compiled_dequantize_turboquant_vectors = torch.compile(
+            dequantize_turboquant_vectors,
+            mode="default",
+            dynamic=True,
+            fullgraph=False,
+        )
+    return _compiled_dequantize_turboquant_vectors

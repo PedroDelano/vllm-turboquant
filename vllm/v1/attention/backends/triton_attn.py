@@ -48,6 +48,7 @@ from vllm.v1.attention.ops.triton_turboquant_kv_update import (
 from vllm.v1.attention.ops.triton_unified_attention import unified_attention
 from vllm.v1.attention.ops.turboquant_kv_cache import (
     TurboQuantLayout,
+    _get_compiled_dequant,
     dequantize_turboquant_vectors,
     get_turboquant_bits,
     get_turboquant_centroids,
@@ -1763,9 +1764,33 @@ class TritonAttentionImpl(AttentionImpl):
         full path).
         """
         import torch.nn.functional as F
+        import os as _os
+        _profile = _os.environ.get("TQ_PROFILE", "0") == "1"
+        # Default "python" (eager): torch.compile + dynamic-shape dequant hangs
+        # at first-call compile on our test config — see Task 7 notes in
+        # docs/superpowers/plans/2026-04-24-turboquant-dequant-perf.md.
+        # The compiled path stays available as an opt-in for future debugging.
+        _dequant_impl = _os.environ.get("TQ_DEQUANT", "python").lower()
 
         assert self.turboquant_bits is not None
         self._validate_turboquant_device(query.device)
+
+        # Choose dequant implementation. `compiled` (default) wraps
+        # dequantize_turboquant_vectors with torch.compile; `python`
+        # forces the eager reference. See
+        # docs/superpowers/specs/2026-04-24-turboquant-dequant-perf-design.md.
+        if _dequant_impl == "python":
+            _dequant_fn = dequantize_turboquant_vectors
+        else:
+            try:
+                _dequant_fn = _get_compiled_dequant()
+            except Exception as e:
+                logger.warning_once(
+                    "torch.compile of dequantize_turboquant_vectors failed "
+                    "(%s); falling back to the eager PyTorch implementation.",
+                    e, scope="local",
+                )
+                _dequant_fn = dequantize_turboquant_vectors
 
         tables = self._get_turboquant_tables(query.device)
         rotations = tables[0]
@@ -1778,34 +1803,107 @@ class TritonAttentionImpl(AttentionImpl):
         seq_lens_cpu = attn_metadata.seq_lens_cpu
         num_seqs = seq_lens_cpu.shape[0]
 
+        if _profile:
+            if not hasattr(self, "_tq_phase_ms"):
+                self._tq_phase_ms = {
+                    "gather_k": 0.0, "gather_v": 0.0,
+                    "dequant_k": 0.0, "dequant_v": 0.0,
+                    "ring_overlay": 0.0, "sdpa": 0.0, "other": 0.0,
+                }
+                self._tq_phase_calls = 0
+                self._tq_phase_total_seqs = 0
+
+        # Step 1 (batched): gather all sequences' packed bytes into a single
+        # contiguous tensor, call dequant once per side, then split back
+        # per-seq for ring overlay + SDPA. Motivated by profiling showing
+        # ~90% of decode time was in per-seq dequant calls dominated by
+        # kernel-launch overhead. See
+        # docs/superpowers/specs/2026-04-24-turboquant-dequant-perf-design.md
+        packed_k_list: list[torch.Tensor] = []
+        packed_v_list: list[torch.Tensor] = []
+        seq_offsets: list[int] = [0]
+        seq_ranges: list[tuple[int, int, int, int] | None] = []
+
+        if _profile:
+            _t0 = torch.cuda.Event(enable_timing=True)
+            _t1 = torch.cuda.Event(enable_timing=True)
+            _t0.record()
+
         for seq_id in range(num_seqs):
-            start = int(query_start_loc_cpu[seq_id].item())
-            end = int(query_start_loc_cpu[seq_id + 1].item())
-            if end == start:
+            q_start = int(query_start_loc_cpu[seq_id].item())
+            q_end = int(query_start_loc_cpu[seq_id + 1].item())
+            if q_end == q_start:
+                seq_ranges.append(None)
                 continue
             seq_len = int(seq_lens_cpu[seq_id].item())
-
             block_table_row = attn_metadata.block_table[seq_id]
+            packed_k_list.append(
+                _gather_packed_kv_for_seq(key_cache, block_table_row, seq_len)
+            )
+            packed_v_list.append(
+                _gather_packed_kv_for_seq(value_cache, block_table_row, seq_len)
+            )
+            d_start = seq_offsets[-1]
+            d_end = d_start + seq_len
+            seq_offsets.append(d_end)
+            seq_ranges.append((d_start, d_end, q_start, q_end))
 
-            packed_k = _gather_packed_kv_for_seq(
-                key_cache, block_table_row, seq_len
-            )
-            packed_v = _gather_packed_kv_for_seq(
-                value_cache, block_table_row, seq_len
-            )
+        if _profile:
+            _t1.record()
+            torch.cuda.synchronize()
+            # Single timed region for gather; put it under gather_k and leave
+            # gather_v at 0 (the split was only useful for the per-seq path).
+            self._tq_phase_ms["gather_k"] += _t0.elapsed_time(_t1)
 
-            dequant_k = dequantize_turboquant_vectors(
-                packed_k, self.kv_cache_dtype, self.head_size,
-                rotations, qjl_matrices, centroids, key_masks,
-                torch.bfloat16,
-            )
-            dequant_v = dequantize_turboquant_vectors(
-                packed_v, self.kv_cache_dtype, self.head_size,
-                rotations, qjl_matrices, centroids, value_masks,
-                torch.bfloat16,
-            )
+        if not packed_k_list:
+            if _profile:
+                self._tq_phase_calls += 1
+            return output
+
+        packed_k_all = torch.cat(packed_k_list, dim=0)
+        packed_v_all = torch.cat(packed_v_list, dim=0)
+
+        if _profile:
+            _t0 = torch.cuda.Event(enable_timing=True)
+            _t1 = torch.cuda.Event(enable_timing=True)
+            _t0.record()
+        dequant_k_all = _dequant_fn(
+            packed_k_all, self.kv_cache_dtype, self.head_size,
+            rotations, qjl_matrices, centroids, key_masks,
+            torch.bfloat16,
+        )
+        if _profile:
+            _t1.record()
+            torch.cuda.synchronize()
+            self._tq_phase_ms["dequant_k"] += _t0.elapsed_time(_t1)
+
+        if _profile:
+            _t0 = torch.cuda.Event(enable_timing=True)
+            _t1 = torch.cuda.Event(enable_timing=True)
+            _t0.record()
+        dequant_v_all = _dequant_fn(
+            packed_v_all, self.kv_cache_dtype, self.head_size,
+            rotations, qjl_matrices, centroids, value_masks,
+            torch.bfloat16,
+        )
+        if _profile:
+            _t1.record()
+            torch.cuda.synchronize()
+            self._tq_phase_ms["dequant_v"] += _t0.elapsed_time(_t1)
+
+        for seq_id in range(num_seqs):
+            rng = seq_ranges[seq_id]
+            if rng is None:
+                continue
+            d_start, d_end, q_start, q_end = rng
+            dequant_k = dequant_k_all[d_start:d_end]
+            dequant_v = dequant_v_all[d_start:d_end]
 
             if recent_ring is not None:
+                if _profile:
+                    _t0 = torch.cuda.Event(enable_timing=True)
+                    _t1 = torch.cuda.Event(enable_timing=True)
+                    _t0.record()
                 recent_k, recent_v, n_recent = gather_recent(
                     recent_ring, seq_id=seq_id
                 )
@@ -1816,9 +1914,17 @@ class TritonAttentionImpl(AttentionImpl):
                 if n_use > 0:
                     dequant_k[-n_use:] = recent_k[-n_use:]
                     dequant_v[-n_use:] = recent_v[-n_use:]
+                if _profile:
+                    _t1.record()
+                    torch.cuda.synchronize()
+                    self._tq_phase_ms["ring_overlay"] += _t0.elapsed_time(_t1)
 
-            q_3d = query[start:end].view(
-                end - start, self.num_heads, self.head_size
+            if _profile:
+                _t0 = torch.cuda.Event(enable_timing=True)
+                _t1 = torch.cuda.Event(enable_timing=True)
+                _t0.record()
+            q_3d = query[q_start:q_end].view(
+                q_end - q_start, self.num_heads, self.head_size
             )
 
             # SDPA expects (batch, heads, tokens, dim).
@@ -1838,9 +1944,30 @@ class TritonAttentionImpl(AttentionImpl):
 
             out = F.scaled_dot_product_attention(
                 q_t, k_t, v_t,
-                is_causal=(end - start) > 1,
+                is_causal=(q_end - q_start) > 1,
                 scale=self.scale,
             )
-            output[start:end] = out.squeeze(0).transpose(0, 1)
+            output[q_start:q_end] = out.squeeze(0).transpose(0, 1)
+            if _profile:
+                _t1.record()
+                torch.cuda.synchronize()
+                self._tq_phase_ms["sdpa"] += _t0.elapsed_time(_t1)
+                self._tq_phase_total_seqs += 1
+
+        if _profile:
+            self._tq_phase_calls += 1
+            # Dump every 50 calls (roughly every 2 decode steps at 24 layers,
+            # or every 1 decode at 48 layers).
+            if self._tq_phase_calls % 50 == 0:
+                total = sum(self._tq_phase_ms.values())
+                lines = [f"[TQPROF] after {self._tq_phase_calls} calls "
+                         f"({self._tq_phase_total_seqs} total-seqs): "
+                         f"total={total:.1f}ms"]
+                for k in ("gather_k","gather_v","dequant_k","dequant_v",
+                          "ring_overlay","sdpa"):
+                    v = self._tq_phase_ms[k]
+                    frac = 100.0 * v / max(total, 1e-6)
+                    lines.append(f"  {k:14s} {v:9.2f}ms ({frac:5.1f}%)")
+                logger.warning("%s", "\n".join(lines))
 
         return output

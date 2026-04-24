@@ -226,3 +226,77 @@ def test_long_prompts_coherent_with_dequant_decode():
     # Target with dequant decode: mean_uniq > 0.5, mean_nl < 0.1.
     assert mean_u > 0.5, f"unique-token ratio {mean_u} still degenerate"
     assert mean_nl < 0.1, f"newline fraction {mean_nl} still degenerate"
+
+
+def test_batched_dequant_equals_per_seq_dequant():
+    """`dequantize_turboquant_vectors` is pure over its token dimension:
+    concatenating multiple sequences' packed bytes along dim 0 and running
+    one dequant call must produce element-equal output to running dequant
+    per sequence then concatenating."""
+    import torch
+    from vllm.v1.attention.ops.turboquant_kv_cache import (
+        build_turboquant_outlier_masks,
+        dequantize_turboquant_vectors,
+        get_turboquant_centroids,
+        get_turboquant_layout,
+        get_turboquant_qjl_matrix,
+        get_turboquant_rotation,
+        quantize_turboquant_vectors,
+    )
+
+    torch.manual_seed(1)
+    head_dim = 64
+    num_kv_heads = 2
+    recipe = "turboquant35"
+    device = torch.device("cuda")
+
+    layout = get_turboquant_layout(recipe, head_dim)
+    rotations = (
+        get_turboquant_rotation(device, layout.groups[0].dim, seed_offset=101),
+        get_turboquant_rotation(device, layout.groups[1].dim, seed_offset=211),
+    )
+    qjl_matrices = (
+        get_turboquant_qjl_matrix(device, layout.groups[0].dim, seed_offset=307),
+        get_turboquant_qjl_matrix(device, layout.groups[1].dim, seed_offset=401),
+    )
+    centroids = {
+        g.mse_bits: get_turboquant_centroids(device, g.dim, g.mse_bits)
+        for g in layout.groups if g.mse_bits > 0
+    }
+
+    # Three sequences with different lengths.
+    seq_lens = [37, 128, 77]
+    K_list = [
+        torch.randn(L, num_kv_heads, head_dim, device=device) * 2.0
+        for L in seq_lens
+    ]
+    masks = build_turboquant_outlier_masks(K_list[0].float(), recipe)
+
+    packed_list = [
+        quantize_turboquant_vectors(
+            k.float(), recipe, rotations, qjl_matrices, centroids, masks,
+        )
+        for k in K_list
+    ]
+
+    per_seq_out = torch.cat(
+        [
+            dequantize_turboquant_vectors(
+                p, recipe, head_dim,
+                rotations, qjl_matrices, centroids, masks, torch.bfloat16,
+            )
+            for p in packed_list
+        ],
+        dim=0,
+    )
+
+    packed_all = torch.cat(packed_list, dim=0)
+    batched_out = dequantize_turboquant_vectors(
+        packed_all, recipe, head_dim,
+        rotations, qjl_matrices, centroids, masks, torch.bfloat16,
+    )
+
+    assert per_seq_out.shape == batched_out.shape
+    assert torch.equal(per_seq_out, batched_out), (
+        f"max abs diff = {(per_seq_out.float() - batched_out.float()).abs().max().item()}"
+    )

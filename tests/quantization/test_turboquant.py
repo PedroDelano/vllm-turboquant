@@ -1013,7 +1013,14 @@ def test_cache_config_requires_feature_gate(monkeypatch):
     with pytest.raises(ValueError, match="enable_turboquant=True"):
         CacheConfig(cache_dtype="turboquant25")
 
-    CacheConfig(cache_dtype="turboquant25", enable_turboquant=True)
+    # The default recent-token ring (capacity=64) requires prefix caching
+    # off — see vllm/config/cache.py _validate_turboquant. A minimal
+    # "just enable turboquant" config needs the matching prefix-cache flag.
+    CacheConfig(
+        cache_dtype="turboquant25",
+        enable_turboquant=True,
+        enable_prefix_caching=False,
+    )
 
 
 @pytest.mark.parametrize(

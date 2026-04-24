@@ -232,6 +232,7 @@ hip_compat.h
 # Benchmark dataset
 benchmarks/**/*.json
 !benchmarks/results_qwen_agent/*.json
+!benchmarks/results_qwen3_5_35b_dequant_perf/*.json
 
 # Linting
 actionlint
