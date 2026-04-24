@@ -441,3 +441,23 @@ The evidence from prompt 0 working correctly — when it fully fits in
 the ring — means the overall approach is right. The last-block-of-
 prefill miss is the only remaining bug between the current state and
 a working fix.
+
+## Addendum — perf follow-up (2026-04-24)
+
+Once the dequant-decode path was coherent, the gap to bf16 wall-time
+(~12.5× on 35B-A3B) became the next target. The perf work landed on
+branch `turboquant-dequant-perf`:
+
+- Step 1 (batch): `dequantize_turboquant_vectors` is called once per
+  side per forward instead of once per sequence. Details in
+  `benchmarks/results_tq_dequant_perf/step1_35b_profile.md`.
+- Step 2 (matmul): the block-Hadamard inverse transforms inside
+  `dequantize_turboquant_vectors` are now dense matmuls against
+  precomputed inverse matrices, skipping the ~log2(dim) butterfly
+  passes. Details in
+  `benchmarks/results_tq_dequant_perf/step2_matmul_rewrite.md`.
+
+Combined wall-time on the 35B qwen-agent bench went from ~404 s
+(pre-perf) → 348 s (step 1) → 301 s (step 2), closing about half the
+gap to bf16 (32 s). Remaining cost is no longer dominated by
+attention; further gains would need a fused decode kernel (deferred).

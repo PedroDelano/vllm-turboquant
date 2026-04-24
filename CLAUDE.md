@@ -50,6 +50,15 @@ Design and implementation notes:
 - `docs/superpowers/specs/2026-04-24-turboquant-dequantize-decode-design.md`
 - `docs/superpowers/plans/2026-04-24-turboquant-dequantize-decode.md`
 
+Perf follow-up on the dequant path (branch `turboquant-dequant-perf`):
+- `docs/superpowers/plans/2026-04-24-turboquant-dequant-perf.md` —
+  step 1 batches dequant across sequences, step 2 replaces the
+  block-Hadamard FWHT loops in `dequantize_turboquant_vectors` with
+  matmuls against precomputed inverse matrices.
+- Wall-time on 35B-A3B qwen-agent bench: ~404 s → 348 s (step 1)
+  → 301 s (step 2). Details in
+  `benchmarks/results_tq_dequant_perf/step2_matmul_rewrite.md`.
+
 Required serve flags for coherent output:
 
 ```

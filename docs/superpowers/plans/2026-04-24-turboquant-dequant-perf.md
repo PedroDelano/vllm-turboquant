@@ -1,5 +1,15 @@
 # TurboQuant Dequant Perf — Implementation Plan
 
+> **Status (2026-04-24):** Step 1 landed as planned. Step 2 was replaced:
+> `torch.compile` hung on first compile under both `mode="reduce-overhead"`
+> and `mode="default"` (see `benchmarks/results_tq_dequant_perf/step2_after_compile.md`).
+> A simpler structural rewrite — replacing the FWHT butterfly loops in
+> `dequantize_turboquant_vectors` with matmuls against precomputed inverse
+> matrices — shipped instead, with equivalent numerical output and no
+> compilation fragility. Results in
+> `benchmarks/results_tq_dequant_perf/step2_matmul_rewrite.md`.
+> Wall-time: 348 s → 301 s (-13.5%), median ITL: 50.8 ms → 39.1 ms (-23%).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close the 12.5× wall-time gap between TurboQuant decode (404 s) and bf16 (32 s) on the 35B-A3B IID bench, by (1) batching `dequantize_turboquant_vectors` across sequences in the current batch, then (2) `torch.compile`-ing the dequant function so its ~8 PyTorch ops fuse.

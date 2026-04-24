@@ -408,6 +408,31 @@ def get_turboquant_qjl_matrix(
     )
 
 
+_INVERSE_MATRIX_FROM_SIGNS_CACHE: dict[tuple[int, bool], torch.Tensor] = {}
+
+
+def _inverse_matrix_from_signs(
+    signs: torch.Tensor,
+    *,
+    normalized: bool,
+) -> torch.Tensor:
+    # `signs` is the output of `_structured_signs_cached` (itself `@cache`'d),
+    # so the same signs object is returned for repeated calls with the same
+    # (device, dim, seed) — meaning `data_ptr()` is stable across requests
+    # and safe as a cache key.
+    key = (signs.data_ptr(), normalized)
+    mat = _INVERSE_MATRIX_FROM_SIGNS_CACHE.get(key)
+    if mat is not None:
+        return mat
+    dim = signs.shape[0]
+    identity = torch.eye(dim, dtype=torch.float32, device=signs.device)
+    mat = _apply_block_hadamard(
+        identity, signs, normalized=normalized, inverse=True
+    )
+    _INVERSE_MATRIX_FROM_SIGNS_CACHE[key] = mat
+    return mat
+
+
 @cache
 def _transform_matrix_cached(
     device_type: str,
@@ -816,6 +841,17 @@ def dequantize_turboquant_vectors(
     group_indices: tuple[torch.Tensor, torch.Tensor],
     dtype: torch.dtype,
 ) -> torch.Tensor:
+    """Dequantise packed TurboQuant K/V bytes back to ``dtype`` tensors.
+
+    The inverse block-Hadamard transforms used to recover the MSE and QJL
+    contributions are linear, so for each group we materialise them once
+    as dense ``[dim, dim]`` matrices (cached by the identity of the sign
+    vectors) and apply them via a single matmul. This replaces a stack
+    of ~log2(dim) butterfly passes per group per call — the decode
+    hot path, measured as ~84% of attention time before the rewrite.
+    See ``benchmarks/results_tq_dequant_perf/step2_matmul_rewrite.md``
+    for the end-to-end perf impact.
+    """
     layout = get_turboquant_layout(kv_cache_dtype, head_size)
     group_outputs: list[torch.Tensor] = []
     cursor = 0
@@ -866,9 +902,15 @@ def dequantize_turboquant_vectors(
         if group_layout.mse_bits > 0:
             rotated_hat = centroids[group_layout.mse_bits][mse_indices.long()]
 
-        mse_hat = _apply_mse_inverse_transform(rotated_hat, rotation)
+        # Materialise the inverse block-Hadamard transforms as dense
+        # [dim, dim] matrices (cached by signs identity) and use matmul
+        # instead of log2(dim) butterfly passes. One launch per group
+        # instead of ~6, which is the hot-path cost in the decode loop.
+        mse_inverse = _inverse_matrix_from_signs(rotation, normalized=True)
+        qjl_inverse = _inverse_matrix_from_signs(qjl_matrix, normalized=False)
+        mse_hat = rotated_hat @ mse_inverse
         qjl_signs = qjl_bits.to(torch.float32).mul_(2.0).sub_(1.0)
-        qjl_hat = _apply_qjl_inverse_transform(qjl_signs, qjl_matrix) * (
+        qjl_hat = (qjl_signs @ qjl_inverse) * (
             TURBOQUANT_QJL_SCALE / group_layout.dim
         )
         group_outputs.append((mse_hat + qjl_hat * residual_norms) * vector_norms)
